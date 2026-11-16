@@ -28,25 +28,43 @@ logger = logging.getLogger(__name__)
 
 _MODEL_CONFIG_KEY = "_anthropic_rejected_thinking"
 _THINKING_TYPES = frozenset({"thinking", "redacted_thinking"})
-_CARRIERS = ("reasoning_details", "anthropic_content_blocks", "_anthropic_content_blocks")
+_CARRIERS = ("reasoning_details", "anthropic_content_blocks", "_anthropic_content_blocks", "bedrock_content_blocks")
 
 
-def _fingerprint(block: Any) -> str | None:
-    if not isinstance(block, dict) or block.get("type") not in _THINKING_TYPES:
-        return None
-    kind = block["type"]
-    value = block.get("signature" if kind == "thinking" else "data")
-    if value in (None, "", b""):
-        return None
+def _is_thinking(block: Any) -> bool:
+    return isinstance(block, dict) and (block.get("type") in _THINKING_TYPES or "reasoningContent" in block)
+
+
+def _digest(kind: str, value: Any) -> str:
     payload = value if isinstance(value, str) else repr(value)
     return hashlib.sha256(f"{kind}\0{payload}".encode("utf-8", "replace")).hexdigest()
 
 
+def _fingerprints(block: Any) -> list[str]:
+    """An Anthropic ``thinking`` / ``redacted_thinking`` block, or a Converse ``reasoningContent`` entry
+    (``bedrock_content_blocks``: a signed text and/or a base64 redacted blob). Carriers store the same
+    opaque value, so a block fingerprints alike in every carrier that holds it."""
+    if not _is_thinking(block):
+        return []
+    if block.get("type") in _THINKING_TYPES:
+        kind = block["type"]
+        opaque = [(kind, block.get("signature" if kind == "thinking" else "data"))]
+    else:
+        reasoning = block["reasoningContent"] if isinstance(block["reasoningContent"], dict) else {}
+        opaque = [("thinking", reasoning.get("signature")), ("redacted_thinking", reasoning.get("redactedContentBase64"))]
+    return [_digest(kind, value) for kind, value in opaque if value not in (None, "", b"")]
+
+
 def tracks_rejected_thinking(agent: Any) -> bool:
-    """Signed-replay routes only (Anthropic and its cloud platforms, MiniMax): Kimi, DeepSeek and
-    third-party routes keep their own replay contract and the one-request ``reasoning_details`` repair."""
+    """Signed-replay routes only (Anthropic and its cloud platforms, MiniMax, Claude on Bedrock Converse):
+    Kimi, DeepSeek, third-party routes and other Converse models keep their own replay contract and the
+    one-request ``reasoning_details`` repair."""
     from agent.anthropic_thinking_policy import SIGNED_REPLAY_ROUTES, anthropic_thinking_route
 
+    if getattr(agent, "api_mode", None) == "bedrock_converse":
+        from agent.bedrock_adapter import converse_replays_signed_reasoning
+
+        return converse_replays_signed_reasoning(getattr(agent, "model", None))
     return getattr(agent, "api_mode", None) == "anthropic_messages" and anthropic_thinking_route(
         getattr(agent, "base_url", None), getattr(agent, "model", None)
     ) in SIGNED_REPLAY_ROUTES
@@ -130,12 +148,7 @@ def strip_rejected_thinking(message: Any, rejected: set[str] | None) -> int:
             continue
         kept = []
         for block in blocks:
-            fingerprint = _fingerprint(block)
-            if (
-                isinstance(block, dict)
-                and block.get("type") in _THINKING_TYPES
-                and (rejected is None or (fingerprint is not None and fingerprint in rejected))
-            ):
+            if _is_thinking(block) and (rejected is None or not rejected.isdisjoint(_fingerprints(block))):
                 removed += 1
             else:
                 kept.append(block)
@@ -179,7 +192,7 @@ def remember_rejected_thinking(agent: Any, api_messages: Any) -> int:
         if isinstance(message, dict)
         for key in _CARRIERS
         for block in (message.get(key) if isinstance(message.get(key), list) else ())
-        if (fingerprint := _fingerprint(block)) is not None
+        for fingerprint in _fingerprints(block)
     }
     # The provider-visible history changed while the canonical content fingerprint did
     # not, so a previous prompt-token anchor is no longer valid for this request shape.

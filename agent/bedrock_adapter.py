@@ -940,6 +940,12 @@ def _converse_replay_policy(model: Optional[str]) -> str:
     return "strip" if any(p in lowered for p in _CONVERSE_REPLAY_STRIP_PATTERNS) else "unsigned"
 
 
+def converse_replays_signed_reasoning(model: Optional[str]) -> bool:
+    """True when Converse replays ``model``'s prior reasoning verbatim, signatures included (Claude): the
+    route where a rejected signature must stay suppressed (agent/anthropic_thinking_replay.py)."""
+    return _converse_replay_policy(model) == "signed"
+
+
 def _minted_outside_claude(issuer: Optional[str]) -> bool:
     if issuer is None:
         return False

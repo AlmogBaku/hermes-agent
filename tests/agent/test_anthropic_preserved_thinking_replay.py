@@ -14,6 +14,8 @@ ANTHROPIC = ("anthropic", "https://api.anthropic.com")
 NOUS = ("nous", "https://inference-api.nousresearch.com/v1/messages")
 OPENROUTER = ("openrouter", "https://openrouter.ai/api/v1")
 KIMI = ("anthropic", "https://api.kimi.com/coding")
+BEDROCK = ("bedrock", "https://bedrock-runtime.eu-central-1.amazonaws.com")
+BEDROCK_CLAUDE = "global.anthropic.claude-fable-5-2"
 
 
 def _signed_turn(question, answer, sig, *, thinking=None):
@@ -58,6 +60,24 @@ def _carrier(thinking="secret chain", opaque=""):
     ]
 
 
+def _converse_turn(question, answer, sig):
+    """A Claude turn as Converse leaves it in a live agent: the ordered sidecar (which Converse replays
+    first) beside the persisted ``reasoning_details`` (all a row reloaded from state.db keeps)."""
+    thinking = "secret chain"
+    return [
+        {"role": "user", "content": question},
+        {
+            "role": "assistant",
+            "content": answer,
+            "reasoning_details": [{"type": "thinking", "thinking": thinking, "signature": sig}],
+            "bedrock_content_blocks": [
+                {"reasoningContent": {"text": thinking, "signature": sig}},
+                {"text": answer},
+            ],
+        },
+    ]
+
+
 def _native_turn(agent, question, size, sig):
     """A turn stored by the real producer: Anthropic response -> transport -> assistant row."""
     from agent.chat_completion_helpers import build_assistant_message
@@ -85,13 +105,13 @@ def _session_db(tmp_path, *session_ids):
     return db
 
 
-def _agent(db, session_id="s1", model="claude-opus-4-6", route=ANTHROPIC):
+def _agent(db, session_id="s1", model="claude-opus-4-6", route=ANTHROPIC, api_mode="anthropic_messages"):
     from agent.agent_runtime_helpers import copy_reasoning_content_for_api
     from agent.message_sanitization import ReasoningReplayRoute
     from agent.context_compressor import ContextCompressor
 
     agent = SimpleNamespace(
-        api_mode="anthropic_messages", provider=route[0], model=model, base_url=route[1],
+        api_mode=api_mode, provider=route[0], model=model, base_url=route[1],
         session_id=session_id, _session_db=db, _persist_disabled=False,
         _current_turn_timestamp=1.0, ephemeral_system_prompt="", prefill_messages=[],
         tools=[], _use_prompt_caching=False, _usage_anchor=None, verbose_logging=False,
@@ -134,8 +154,19 @@ def _select_canonical_clone(agent, api, canonical, incoming, logger=None):
     return copy.deepcopy(canonical)
 
 
+def _wire(agent, api_messages):
+    """The agent's converter: Converse for Claude on Bedrock Converse, else Anthropic Messages."""
+    if agent.api_mode == "bedrock_converse":
+        from agent.bedrock_adapter import convert_messages_to_converse
+
+        return convert_messages_to_converse(copy.deepcopy(api_messages), model=agent.model)[1]
+    return convert_messages_to_anthropic(
+        copy.deepcopy(api_messages), base_url=agent.base_url, model=agent.model
+    )[1]
+
+
 def _assemble_and_wire(agent, history):
-    """Production request assembly, then the native converter: (assembled, wire messages)."""
+    """Production request assembly, then the agent's converter: (assembled, wire messages)."""
     from agent.turn_request_assembly import assemble_api_request
 
     assembled = assemble_api_request(
@@ -145,19 +176,19 @@ def _assemble_and_wire(agent, history):
         pending_moa_prepared_request=None,
         request_logger=logging.getLogger("anthropic-preserved-thinking-test"),
     )
-    _, wire = convert_messages_to_anthropic(
-        copy.deepcopy(assembled.api_messages), base_url=agent.base_url, model=agent.model
-    )
-    return assembled, wire
+    return assembled, _wire(agent, assembled.api_messages)
 
 
 def _thinking_blocks(wire):
+    """Replayed thinking on either wire; a Converse ``reasoningContent`` reads as its inner block."""
     return [
-        block
+        block if "reasoningContent" not in block
+        else block["reasoningContent"].get("reasoningText") or block["reasoningContent"]
         for message in wire
         if message["role"] == "assistant" and isinstance(message["content"], list)
         for block in message["content"]
-        if isinstance(block, dict) and block.get("type") in {"thinking", "redacted_thinking"}
+        if isinstance(block, dict)
+        and (block.get("type") in {"thinking", "redacted_thinking"} or "reasoningContent" in block)
     ]
 
 
@@ -183,7 +214,7 @@ def _reject_signatures(agent, history):
         SimpleNamespace(reason=FailoverReason.thinking_signature), retry, history, request,
     )
     assert retry.thinking_sig_retry_attempted and history == before
-    assert not _thinking_blocks(convert_messages_to_anthropic(request, model=agent.model)[1])
+    assert not _thinking_blocks(_wire(agent, request))
 
 
 _PRESERVED = [
@@ -301,7 +332,7 @@ def test_estimates_charge_exactly_the_thinking_the_wire_replays(tmp_path, monkey
 @pytest.mark.parametrize(
     "boundary",
     ["same_agent", "rebuild", "session_switch", "compression_child", "context_selection",
-     "carrier", "unfingerprintable", "kimi_route", "future_family"],
+     "carrier", "unfingerprintable", "kimi_route", "future_family", "converse", "converse_rebuild"],
 )
 def test_rejected_thinking_never_returns_and_nothing_else_is_suppressed(
     tmp_path, monkeypatch, boundary
@@ -309,14 +340,23 @@ def test_rejected_thinking_never_returns_and_nothing_else_is_suppressed(
     """Invariant: once Anthropic rejects a signature, every later request in that conversation
     replays exactly the never-rejected signed thinking, whatever lifetime boundary it crosses;
     the rejection drops the stale usage anchor. Routes Anthropic does not sign for keep their
-    own replay contract."""
+    own replay contract. Claude on Bedrock Converse is a signed route: a /model switch onto it
+    rebuilds the system prompt, so earlier turns' signatures (an AnthropicBedrock turn's
+    ``anthropic_content_blocks``, a live Converse turn's ``bedrock_content_blocks``) are rejected."""
     from agent.conversation_compression import _carry_session_state_to_child
 
     db = _session_db(tmp_path, "s1", "s2")
+    converse = boundary.startswith("converse")
+
+    def new_agent(session_id="s1"):
+        if converse:
+            return _agent(db, session_id, model=BEDROCK_CLAUDE, route=BEDROCK, api_mode="bedrock_converse")
+        return _agent(db, session_id)
+
     agent = (
         _agent(db, route=KIMI, model="kimi-k2.5") if boundary == "kimi_route"
         else _agent(db, model="claude-fable-5-2") if boundary == "future_family"
-        else _agent(db)
+        else new_agent()
     )
     agent._usage_anchor = {"prompt_tokens": 999}
     _patch_assembly_loop(
@@ -327,13 +367,17 @@ def test_rejected_thinking_never_returns_and_nothing_else_is_suppressed(
         rejected = [{"role": "user", "content": "Q1"}, {"role": "assistant", "content": "A1"}]
     elif boundary == "carrier":
         rejected = _carrier()
+    elif converse:
+        rejected = _carrier() + _converse_turn("Q2", "A2", "sig_rejected_converse")
     _reject_signatures(agent, rejected)
     if boundary != "kimi_route":
         assert agent._usage_anchor is None
     reader = agent
 
-    if boundary in {"rebuild", "context_selection", "carrier"}:
-        reader = _agent(db)  # fresh process on the same session
+    if boundary in {"rebuild", "context_selection", "carrier", "converse_rebuild"}:
+        reader = new_agent()  # fresh process on the same session
+    if boundary == "converse_rebuild":  # the ordered Converse sidecar is live-only
+        rejected = [{k: v for k, v in row.items() if k != "bedrock_content_blocks"} for row in rejected]
     elif boundary == "session_switch":
         # s2 was rejected by an earlier process; the live agent then resumes s2.
         rejected = _signed_turn("Q1", "A1", "sig_rejected_s2")
@@ -363,5 +407,7 @@ def test_rejected_thinking_never_returns_and_nothing_else_is_suppressed(
         replayed = ["sig_rejected_1", "sig_rejected_2"] + replayed
     assert [block.get("signature") for block in _thinking_blocks(wire)] == replayed
     # The rejected carrier's visible answer and tool call still replay; only thinking goes.
-    assert ("tool_use" in repr(wire)) is (boundary == "carrier")
+    assert ("tool_use" in repr(wire) or "toolUse" in repr(wire)) is (boundary == "carrier" or converse)
     assert "secret chain" not in repr(wire)
+    if converse:
+        assert {"text": "A2"} in [block for message in wire for block in message["content"]]
