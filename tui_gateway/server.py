@@ -24,6 +24,9 @@ from typing import Any, Callable, NamedTuple, Optional
 
 # Several of these look unused here but are resolved BARE by split-module bodies rebound onto this
 # namespace (method_ctx.bind_module) — deleting one breaks a handler at call time, not import time.
+from agent.model_switch_note import (
+    MODEL_SWITCH_NOTE_PREFIX, missing_guidance, model_switch_note, route_was_told, told_route,
+)
 from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
 from hermes_constants import (
     get_hermes_home, get_hermes_home_override, get_process_hermes_home, profile_name_for_home,
@@ -1118,35 +1121,12 @@ def _live_session_agent_db(session: dict | None):
     return None if db is None else (agent, session_key, db)
 
 
-def _persist_live_session_system_prompt(session: dict | None) -> None:
-    """Refresh the stored system prompt after a live runtime identity change."""
-    live = _live_session_agent_db(session)
-    if live is None or not hasattr(live[0], "_build_system_prompt") or not hasattr(live[2], "update_system_prompt"):
-        return
-    agent, session_key, db = live
-    # Re-bind the session's profile runtime scope (the build's finally reset it → root profile's SOUL.md/skills,
-    # #50233) and session context (on the RPC thread _SESSION_CWD is unset → the process TERMINAL_CWD would
-    # persist). The full scope, not HERMES_HOME alone: the external memory provider's system_prompt_block()
-    # reads its credential through get_secret, which fails closed once this process multiplexes (#112927).
-    session_tokens = _set_session_context(session_key, cwd=_session_cwd(session))
-    try:
-        with _session_profile_runtime_scope(session):
-            prompt = agent._cached_system_prompt = agent._build_system_prompt(None)
-        db.update_system_prompt(getattr(agent, "session_id", None) or session_key, prompt)
-    except Exception:
-        logger.warning("failed to persist live session system prompt for session %s", session_key, exc_info=True)
-    finally:
-        _clear_session_context(session_tokens)
-
-
-# Stable leading text of the model-switch marker (builder + dedup); only the newest marker is meaningful.
-# Only the newest marker is meaningful (it names the *currently* active model); older ones are stale and
-# would otherwise be re-sent to the provider on every turn (#65891).
-_MODEL_SWITCH_MARKER_PREFIX = "[System: The active model for this chat has changed to "
+# Stable leading text of the model-switch marker; the newest marker names the active model.
+_MODEL_SWITCH_MARKER_PREFIX = MODEL_SWITCH_NOTE_PREFIX
 
 
 def _is_model_switch_marker(entry: Any) -> bool:
-    """Whether a history entry is a (self-replacing) model-switch marker."""
+    """Whether a history entry is a model-switch marker."""
     if not isinstance(entry, dict):
         return False
     content = entry.get("content")
@@ -1155,34 +1135,38 @@ def _is_model_switch_marker(entry: Any) -> bool:
 
 def _is_pivot_marker(entry: Any) -> bool:
     """A ``role=user`` pivot the gateway splices in mid-turn (model switch or personality change) — either can
-    be the sole reason turn-start and current history differ. Only the model-switch marker is self-replacing."""
+    be the sole reason turn-start and current history differ."""
     return _is_model_switch_marker(entry) or (isinstance(entry, dict) and entry.get("display_kind") == "personality_switch")
 
 
 def _append_model_switch_marker(session: dict | None, *, model: str, provider: str) -> None:
-    """Record a real system-history pivot after a live model switch. Only the newest marker is kept (each
-    switch strips prior ones, so N switches leave one marker, not N re-sent every API call; self-healing
-    across resumes because the next switch collapses whatever a reload brought back).
+    """Record a real system-history pivot after a live model switch: the announcement of the new route,
+    with the new model's guidance the kept system prompt lacks (agent/model_switch_note.py).
 
-    See #65891.
+    Append-only. Earlier markers stay where they are — the newest one names the active model — because
+    deleting a turn from the middle of the transcript changes what the conversation already sent: the
+    cached prefix breaks there, and Claude models that check preserved thinking reject every later
+    thinking block. Superseded markers (~100 tokens each, #65891) are summarized away with the other
+    older turns at the next compaction.
     """
     session_key = str((session or {}).get("session_key") or "").strip()
     if not session_key:
         return
-    provider_part = f" via provider {provider}" if provider else ""
-    marker = (
-        f"{_MODEL_SWITCH_MARKER_PREFIX}{model}{provider_part}. From this point forward, use this runtime "
-        "metadata when answering questions about what model/provider is active.]")
+    agent = session.get("agent")
+    prompt = getattr(agent, "_cached_system_prompt", None) if agent is not None else None
+    prompt = prompt if isinstance(prompt, str) else ""
+    marker = model_switch_note(model, provider, missing_guidance(agent, prompt) if prompt else ())
     # A user message, not system: strict OpenAI-compatible providers (vLLM, Qwen) reject non-leading system messages.
     # See #48338.
     entry: dict[str, Any] = {"role": "user", "content": marker, "display_kind": "model_switch"}
     with session.get("history_lock") or contextlib.nullcontext():
         history = session.setdefault("history", [])
-        history[:] = [h for h in history if not _is_model_switch_marker(h)]
+        # Nothing to announce when the model was last told this route (a same-route pick, a config re-adoption).
+        if route_was_told(told_route(prompt, history), model, provider):
+            return
         history.append(entry)
         session["history_version"] = int(session.get("history_version", 0)) + 1
     try:
-        agent = session.get("agent")
         db = getattr(agent, "_session_db", None) if agent is not None else None
         if db is None:
             _ensure_session_db_row(session)
@@ -1193,9 +1177,6 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
                 # live agent writes to, or a model switch between turns on a rotated session files the notice
                 # under a parent the conversation no longer reads from (#123545).
                 target = _submit_row_target_key(session)
-                # The in-memory strip above keeps one marker; the durable rows need the same invariant or N
-                # switches leave N active rows that all replay on resume (#65891 kept it in memory only).
-                db.deactivate_messages_by_display_kind(target, "model_switch")
                 from agent.message_metadata import stamp_message_uid
                 entry["_row_id"] = db.append_message(
                     session_id=target, role="user", content=marker, display_kind="model_switch",
@@ -1205,7 +1186,7 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
         # warning, not debug: filing the pivot in the LIVE session (#123545) means this write can now hit
         # CompressionSessionClosedError on a closed parent, which the old session_key target could not.
         # Swallowed at debug, a model switch silently loses its durable notice — the next resume replays
-        # without it and nothing lands in errors.log. Matches _persist_live_session_system_prompt above.
+        # without it and nothing lands in errors.log.
         logger.warning("failed to persist model switch marker", exc_info=True)
 
 

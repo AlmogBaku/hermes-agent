@@ -385,10 +385,10 @@ def _prompt_building_session(profile_home, key):
 
 
 def test_off_turn_prompt_rebuilds_run_under_the_sessions_profile_scope(two_homes, monkeypatch):
-    """Regression for #112927: ``session.context_breakdown`` (Desktop refetches it after every turn) and the
-    model-switch prompt re-persist rebuilt the system prompt with no secret scope, so the external memory
+    """Regression for #112927: ``session.context_breakdown`` (Desktop refetches it after every turn) rebuilt
+    the system prompt with no secret scope, so the external memory
     provider's ``system_prompt_block()`` hit ``UnscopedSecretError`` on the LAUNCH profile once the process
-    hosted a second home — and for a secondary they resolved the launch profile's credential/home."""
+    hosted a second home — and for a secondary it resolved the launch profile's credential/home."""
     from agent import system_prompt
 
     root, b = two_homes
@@ -402,9 +402,7 @@ def test_off_turn_prompt_rebuilds_run_under_the_sessions_profile_scope(two_homes
     monkeypatch.setattr(server, "_sessions", sessions)
     assert _probe("b")["b_ref"] == B_VAL  # flips the process to fail-closed multi-profile hosting
 
-    for sid, home, key in (("sa", root, "launch-mem-key"), ("sb", b, "b-mem-key"), ("sa", root, "launch-mem-key")):
+    for sid in ("sa", "sb", "sa"):
         resp = server._methods["session.context_breakdown"]("rid", {"session_id": sid})
         assert "error" not in resp, resp
-        server._persist_live_session_system_prompt(sessions[sid])
-        assert sessions[sid]["agent"]._cached_system_prompt == f"{home}|{key}"
     assert os.environ.get("MEM_PROVIDER_KEY") is None

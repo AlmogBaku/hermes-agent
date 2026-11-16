@@ -169,6 +169,14 @@ CODING_PROFILE = ContextProfile(
 
 # ── Detection helpers ───────────────────────────────────────────────────────
 
+def edit_format_guidance(model: Optional[str]) -> tuple[Optional[str], tuple[str, ...]]:
+    """``(line for model, every family's line)``: the coding brief's edit-format nudge for ``model``
+    (None for an unknown family), and all of them, so a kept prompt's nudge can be recognised."""
+    family = _model_family(model)
+    return (_EDIT_FORMAT_GUIDANCE[family][1] if family else None,
+            tuple(text for _, text in _EDIT_FORMAT_GUIDANCE.values()))
+
+
 def _model_family(model: Optional[str]) -> Optional[str]:
     """Edit-format family key for a model id, or ``None`` (neutral wording applies)."""
     lowered = (model or "").lower()

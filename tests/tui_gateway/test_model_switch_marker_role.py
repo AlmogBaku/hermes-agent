@@ -30,67 +30,38 @@ class TestAppendModelSwitchMarkerRole:
 
 
 
-class TestModelSwitchMarkerDedup:
-    """#65891: only the newest marker is meaningful; older ones must not
-    accumulate in the live history and burn context tokens every turn."""
+class TestModelSwitchMarkerAppendOnly:
+    """A switch appends its marker and never edits the transcript before it: deleting an earlier
+    marker changes what the conversation already sent — the cached prefix breaks there, and Claude
+    models that check preserved thinking reject every later thinking block. The newest marker names
+    the active model; superseded ones are summarized away at the next compaction."""
 
     @staticmethod
     def _markers(session: dict) -> list:
-        from tui_gateway.server import _is_model_switch_marker
+        return [h["content"] for h in session["history"] if _is_marker(h)]
 
-        return [h for h in session["history"] if _is_model_switch_marker(h)]
-
-    def test_second_switch_replaces_first_marker(self) -> None:
-        session: dict = {"session_key": "s", "history": []}
-        _append_model_switch_marker(session, model="model-a", provider="p")
+    def test_each_switch_appends_and_leaves_earlier_entries_untouched(self) -> None:
+        earlier = [
+            {"role": "user", "content": "q1"},
+            _make_marker_entry("model-a"),
+            {"role": "assistant", "content": "a1"},
+        ]
+        session: dict = {"session_key": "s", "history": [dict(h) for h in earlier], "history_version": 0}
         _append_model_switch_marker(session, model="model-b", provider="p")
+        _append_model_switch_marker(session, model="model-c", provider="p")
+        assert session["history"][:3] == earlier
         markers = self._markers(session)
-        assert len(markers) == 1, "a second switch must replace, not stack, the marker"
-        assert "model-b" in markers[0]["content"]
-        assert "model-a" not in markers[0]["content"]
-        # The surviving marker is the last history entry.
-        assert session["history"][-1] is markers[0]
+        assert len(markers) == 3
+        assert "model-b via provider p" in markers[1] and "model-c via provider p" in markers[2]
+        assert session["history"][-1]["content"] == markers[2]
+        assert session["history_version"] == 2
 
-
-    def test_dedup_preserves_real_conversation_turns(self) -> None:
-        session: dict = {
-            "session_key": "s",
-            "history": [
-                {"role": "user", "content": "hello"},
-                {"role": "assistant", "content": "hi"},
-            ],
-        }
-        _append_model_switch_marker(session, model="model-a", provider="p")
-        _append_model_switch_marker(session, model="model-b", provider="p")
-        # Real turns untouched; exactly one marker, appended at the end.
-        assert session["history"][0] == {"role": "user", "content": "hello"}
-        assert session["history"][1] == {"role": "assistant", "content": "hi"}
-        assert len(self._markers(session)) == 1
-        assert len(session["history"]) == 3
-
-    def test_prior_marker_between_turns_is_removed(self) -> None:
-        # A stale marker not at the tail (a later turn followed it) is still
-        # stripped on the next switch.
-        session: dict = {
-            "session_key": "s",
-            "history": [
-                {"role": "user", "content": "q1"},
-                _make_marker_entry("model-a"),
-                {"role": "assistant", "content": "a1"},
-            ],
-        }
-        _append_model_switch_marker(session, model="model-b", provider="p")
-        markers = self._markers(session)
-        assert len(markers) == 1
-        assert "model-b" in markers[0]["content"]
-        # The real turns are preserved in order.
-        assert [h["content"] for h in session["history"] if not _is_marker(h)] == ["q1", "a1"]
-
-    def test_history_version_increments_once_on_replace(self) -> None:
+    def test_a_switch_to_the_route_last_announced_appends_nothing(self) -> None:
         session: dict = {"session_key": "s", "history": [], "history_version": 0}
-        _append_model_switch_marker(session, model="model-a", provider="p")
         _append_model_switch_marker(session, model="model-b", provider="p")
-        assert session["history_version"] == 2  # one increment per switch
+        _append_model_switch_marker(session, model="model-b", provider="p")
+        assert len(self._markers(session)) == 1
+        assert session["history_version"] == 1
 
 
 def _make_marker_entry(model: str) -> dict:

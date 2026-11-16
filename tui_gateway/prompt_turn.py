@@ -274,8 +274,8 @@ def _commit_turn_history(
     session: dict, result: dict, history: list, history_version: int) -> str | None:
     """Write the agent's messages back to session history; returns a client warning or None.
     If history_version moved mid-turn, the only tolerated mutation is a gateway-inserted
-    pivot marker (compare content, not indices: ``_append_model_switch_marker`` strips prior
-    markers in place); any other desync is surfaced, never dropped."""
+    pivot marker (compared by content with the markers filtered out); any other desync is surfaced,
+    never dropped."""
     with session["history_lock"]:
         current_version = int(session.get("history_version", 0))
         if current_version == history_version:
@@ -287,8 +287,8 @@ def _commit_turn_history(
         # the current history that now contains the marker. A personality change counts here too: unlike a
         # model switch it has no pending queue, so `/personality` during a running turn lands immediately
         # and used to read as a genuine desync, dropping the finished turn (#82756).
-        # _append_model_switch_marker strips prior markers in-place then appends a new one, so the delta is
-        # NOT a simple tail-slice — we must compare content, not indices.
+        # Compare content with every pivot marker filtered out, so a marker inserted anywhere reads as the
+        # only change.
         current_history = list(session["history"])
         history_no_markers = [e for e in history if not _is_pivot_marker(e)]
         current_no_markers = [e for e in current_history if not _is_pivot_marker(e)]
@@ -1064,7 +1064,7 @@ def _release_turn_scopes(sid: str, session: dict, st: _TurnRun) -> None:
             _restore_agent_model_runtime(st.agent, st.one_turn_restore)
             _restart_slash_worker(sid, session)
             _persist_live_session_runtime(session)
-            _persist_live_session_system_prompt(session)
+            # Prompt kept: the next turn announces the restored model (agent/model_switch_note.py).
         except Exception:
             logger.debug("TUI one-turn model restore failed", exc_info=True)
     scopes = st.scopes

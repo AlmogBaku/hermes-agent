@@ -724,9 +724,7 @@ def _submit_row_target_key(session: dict) -> str:
     to the stale key splits one turn's rows across two sessions: the user row in the parent, every tool
     row and the final text in the child (#123545, evidence A + B).
 
-    The live id IS the authority — it is the value the turn will flush under, and the same
-    ``getattr(agent, "session_id", None) or session_key`` the sibling system-prompt persist already uses
-    against this handle (``_persist_live_session_system_prompt``). Do NOT re-resolve through the lineage
+    The live id IS the authority — it is the value the turn will flush under. Do NOT re-resolve through the lineage
     here: ``resolve_resume_session_id`` returns the deepest node that has MESSAGES, so the freshly-minted
     child of a just-published rotation resolves back to the parent and the fix would no-op exactly when
     it is needed. The choice is made ONCE here and recorded on the staged dict under

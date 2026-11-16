@@ -96,7 +96,7 @@ def _queue_then_apply(homes, monkeypatch, raw_model, pick, resolved):
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kw: ModelSwitchResult(
         success=True, is_global=True, **resolved))
     swaps, notices = [], []
-    for name in ("_restart_slash_worker", "_persist_live_session_runtime", "_persist_live_session_system_prompt",
+    for name in ("_restart_slash_worker", "_persist_live_session_runtime",
                  "_append_model_switch_marker", "_emit_session_info", "_merge_preflight_warning"):
         monkeypatch.setattr(server, name, lambda *a, **kw: None)
     monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: notices.append((event, payload)))

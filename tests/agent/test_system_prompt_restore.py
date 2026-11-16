@@ -152,12 +152,12 @@ class TestSurfaceSwitch:
         assert "the interface section in the system prompt above" in agent._surface_switch_note
 
     def test_rebuild_also_retires_a_stale_note(self):
-        # A rebuild for an unrelated reason (a model switch) refreshes the prompt but not the
+        # A rebuild for an unrelated reason (an emptied route) refreshes the prompt but not the
         # note already sitting in the transcript.
         db = MagicMock()
         db.get_session.return_value = {"system_prompt": self._stored("desktop")}
         agent = _make_agent(session_db=db, prebuilt_prompt=self._stored("desktop"))
-        agent.model = "other-model"
+        agent.provider = ""
         agent.platform = "desktop"
         agent._platform_hint_overrides = None
         agent._surface_switch_note = ""
@@ -235,50 +235,8 @@ class TestStoredPromptReuse:
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
-    def test_present_row_with_stale_runtime_identity_rebuilds(self, caplog):
-        """Stored prompts are cache gold unless their runtime identity is stale.
-
-        A live /model switch updates the agent and DB model_config immediately.
-        If the old system_prompt snapshot still says the previous model,
-        blindly restoring it makes the next turn call the new model while the
-        model reads old `Model:` metadata ("what model are you?" lies).
-        """
-        stored = (
-            "You are Hermes Agent.\n\n"
-            "Conversation started: Tuesday, June 16, 2026\n"
-            "Session ID: test-session-id\n"
-            "Model: anthropic/claude-opus-4.8-fast\n"
-            "Provider: openrouter"
-        )
-        db = MagicMock()
-        db.get_session.return_value = {"system_prompt": stored}
-        agent = _make_agent(
-            session_db=db,
-            prebuilt_prompt=(
-                "You are Hermes Agent.\n\n"
-                "Conversation started: Tuesday, June 16, 2026\n"
-                "Session ID: test-session-id\n"
-                "Model: openai/gpt-5.5\n"
-                "Provider: openrouter"
-            ),
-        )
-        agent.model = "openai/gpt-5.5"
-
-        with caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
-            _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
-
-        assert agent._cached_system_prompt.endswith(
-            "Model: openai/gpt-5.5\nProvider: openrouter"
-        )
-        agent._build_system_prompt.assert_called_once_with(None)
-        db.update_system_prompt.assert_called_once_with(
-            agent.session_id, agent._cached_system_prompt
-        )
-        assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
-
-
     def test_rebuilding_an_existing_sessions_prompt_keeps_its_pinned_tools(self, tmp_path):
-        """A continuing session whose stored prompt goes stale (model switch, cwd drift) is rebuilt
+        """A continuing session whose stored prompt goes stale (an emptied route, cwd drift) is rebuilt
         by whichever surface resumes it — ``-q --resume`` builds without skill_manage. tools[] sits
         ahead of the prompt and only /new, /reload-mcp and compaction may re-derive it, so the
         rebuild keeps the pinned array and never persists its own surface's build over the pin."""
@@ -293,9 +251,10 @@ class TestStoredPromptReuse:
         pinned = [_tool("read_file"), _tool("skill_manage"), _tool("terminal")]
         with SessionDB(db_path=tmp_path / "state.db") as db:
             db.create_session("test-session-id", source="tui")
-            db.update_system_prompt("test-session-id", "Model: old-model\nProvider: openrouter")
+            db.update_system_prompt("test-session-id", "Model: test-model\nProvider: openrouter")
             db.update_session_tool_names("test-session-id", {"version": tool_pin_version(), "tools": pinned})
             agent = _make_agent(session_db=db)
+            agent.provider = ""  # the stored route line no longer has a live value
             agent.side_agent = False
             agent._bot_mode_protocol = False
             agent.tools = [_tool("read_file"), _tool("terminal")]  # the -q footprint pruned skill_manage

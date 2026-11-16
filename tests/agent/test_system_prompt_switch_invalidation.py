@@ -59,8 +59,9 @@ def test_compression_tip_adoption_applies_the_identity_check(db):
 
     ``_adopt_live_compression_child`` bypasses ``_restore_or_build_system_prompt`` (the turn
     only restores while the slot is None), so with the NULL gone it must apply the identity
-    check itself: a tip whose route moved since its last persist stays unseeded (the next
-    restore rebuilds), while a matching tip is adopted verbatim.
+    check itself: a tip whose route line has no live value anymore stays unseeded (the next
+    restore rebuilds), while a matching tip, or one whose route moved to another model (the turn
+    announces the switch, agent/model_switch_note.py), is adopted verbatim.
 
     The slot starts NON-NULL — it holds the parent's prompt, exactly as a live agent that
     cached a turn before the parent rotated. Adoption moves ``agent.session_id`` onto the
@@ -90,9 +91,10 @@ def test_compression_tip_adoption_applies_the_identity_check(db):
         assert _adopt_live_compression_child(agent, db, "parent") is not None
         return agent
 
-    rejected = _adopt("model-b", "prov-b")
+    rejected = _adopt("model-a", "")
     assert rejected.session_id == "child"
     assert rejected._cached_system_prompt is None
+    assert _adopt("model-b", "prov-b")._cached_system_prompt == stale
     assert _adopt("model-a", "prov-a")._cached_system_prompt == stale
 
 

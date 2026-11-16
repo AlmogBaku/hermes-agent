@@ -2432,8 +2432,8 @@ def switch_model(
         )
     except Exception as _reasoning_err:
         logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
-    # Invalidate the cached system prompt so it rebuilds next turn.
-    agent._cached_system_prompt = None
+    from agent.model_switch_note import keep_prompt_across_switch  # the next turn announces the switch
+    keep_prompt_across_switch(agent)
     # Publish the destination capability map only after every runtime setup above has succeeded.
     # Failed switches must leave the old map intact.
     agent.runtime_capabilities = destination_capabilities

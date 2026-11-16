@@ -10730,9 +10730,6 @@ def test_config_set_model_switches_agent_without_touching_env(monkeypatch):
                 {"session_id": session_id, "role": role, "content": content}
             )
 
-        def deactivate_messages_by_display_kind(self, _session_id, _display_kind):
-            return 0
-
     agent = Agent()
     db = SessionDB()
     agent._session_db = db
@@ -10777,20 +10774,16 @@ def test_config_set_model_switches_agent_without_touching_env(monkeypatch):
         # ...override recorded on the session...
         assert session["model_override"]["model"] == "anthropic/claude-sonnet-4.6"
         assert session["model_override"]["provider"] == "anthropic"
-        # ...the persisted prompt snapshot tracks the new runtime identity too.
-        # Without this, the next turn restored the old system prompt from the DB:
-        # API calls went to the new model, but "what model are you?" still read
-        # "Model: old/model" from the stored prompt.
-        assert db.system_prompt == (
-            "Model: anthropic/claude-sonnet-4.6\nProvider: anthropic"
-        )
-        assert agent._cached_system_prompt == db.system_prompt
+        # ...the system prompt the conversation already sent is kept, byte for byte (rebuilding it breaks
+        # the cached prefix and every earlier preserved-thinking block); the appended marker is what
+        # tells the model, so "what model are you?" reads the new route (agent/model_switch_note.py).
+        assert db.system_prompt is None
+        assert agent._cached_system_prompt == "Model: gpt-5.3-codex\nProvider: openai-codex"
         assert session["history"][-1]["role"] == "user"
-        assert "changed to anthropic/claude-sonnet-4.6" in session["history"][-1]["content"]
+        assert "changed to anthropic/claude-sonnet-4.6 via provider anthropic" in session["history"][-1]["content"]
         assert db.messages[-1] == {
             # The agent's own db handle belongs to the agent's live session id, not the gateway's
-            # session_key — the same `getattr(agent, "session_id", None) or session_key` the sibling
-            # system-prompt persist uses one screen up (#123545: these two must not diverge).
+            # session_key (#123545: the durable marker must land where the conversation is read from).
             "session_id": agent.session_id,
             "role": "user",
             "content": session["history"][-1]["content"],
@@ -21972,210 +21965,6 @@ def test_prompt_submit_unconfirmed_truncation_refuses_before_target_resolution(
         assert len(sess["history"]) == 4
     finally:
         server._sessions.pop(sid, None)
-
-
-def test_persist_live_session_system_prompt_uses_profile_home(monkeypatch, tmp_path):
-    """Issue #50233: _persist_live_session_system_prompt must re-bind
-    HERMES_HOME to the session's profile before rebuilding the system
-    prompt.  Without this, a /model switch rebuilds the prompt with the
-    root profile's SOUL.md and skills instead of the session's profile.
-    """
-    profile_home = tmp_path / "profile-work"
-    profile_home.mkdir()
-    (profile_home / "SOUL.md").write_text(
-        "# Work persona\nYou are a work agent.", encoding="utf-8"
-    )
-
-    built_homes = []
-
-    class FakeAgent:
-        model = "test-model"
-        provider = "test"
-        _cached_system_prompt = None
-        _session_db = None
-
-        def _build_system_prompt(self, system_message=None):
-            from hermes_constants import get_hermes_home
-            home = get_hermes_home()
-            built_homes.append(str(home))
-            soul = (
-                (home / "SOUL.md").read_text(encoding="utf-8-sig")
-                if (home / "SOUL.md").exists()
-                else ""
-            )
-            return f"System prompt from {home}\n{soul}"
-
-    class FakeDB:
-        def update_system_prompt(self, session_id, prompt):
-            pass
-
-    agent = FakeAgent()
-    agent._session_db = FakeDB()
-    session = {
-        "agent": agent,
-        "session_key": "test-key",
-        "profile_home": str(profile_home),
-    }
-
-    server._persist_live_session_system_prompt(session)
-
-    # The system prompt must have been built while the override pointed
-    # to the profile home, not the root ~/.hermes.
-    assert len(built_homes) == 1, f"expected 1 build, got {built_homes}"
-    assert str(profile_home) in built_homes[0], (
-        f"system prompt built with wrong home: {built_homes[0]}"
-    )
-    assert "Work persona" in agent._cached_system_prompt
-
-    # The override must have been reset after the call.
-    from hermes_constants import get_hermes_home_override
-    assert get_hermes_home_override() is None
-
-
-def test_persist_live_session_system_prompt_no_profile_is_unchanged(monkeypatch):
-    """Sessions without a profile_home must not set/clear any override —
-    the function should behave identically to before the fix."""
-    class FakeAgent:
-        model = "test"
-        _cached_system_prompt = None
-        _session_db = None
-
-        def _build_system_prompt(self, system_message=None):
-            return "plain prompt"
-
-    class FakeDB:
-        def update_system_prompt(self, session_id, prompt):
-            pass
-
-    agent = FakeAgent()
-    agent._session_db = FakeDB()
-    session = {
-        "agent": agent,
-        "session_key": "test-key",
-        "profile_home": None,
-    }
-
-    # Should not raise, should still build and cache.
-    server._persist_live_session_system_prompt(session)
-    assert agent._cached_system_prompt == "plain prompt"
-
-
-def test_persist_live_session_system_prompt_restores_pre_existing_override(tmp_path):
-    """reset_hermes_home_override() restores the previous ContextVar state,
-    not just the unset case: when a caller already holds an override, the
-    persist call must scope to the session's profile and then hand the
-    caller's override back, rather than clearing it to None."""
-    from hermes_constants import get_hermes_home_override
-
-    outer_home = tmp_path / "profile-outer"
-    outer_home.mkdir()
-    inner_home = tmp_path / "profile-inner"
-    inner_home.mkdir()
-    (inner_home / "SOUL.md").write_text(
-        "# Inner persona\nYou are the inner agent.", encoding="utf-8"
-    )
-
-    built_homes = []
-
-    class FakeAgent:
-        model = "test-model"
-        provider = "test"
-        _cached_system_prompt = None
-        _session_db = None
-
-        def _build_system_prompt(self, system_message=None):
-            from hermes_constants import get_hermes_home
-            built_homes.append(str(get_hermes_home()))
-            return "inner prompt"
-
-    class FakeDB:
-        def update_system_prompt(self, session_id, prompt):
-            pass
-
-    agent = FakeAgent()
-    agent._session_db = FakeDB()
-    session = {
-        "agent": agent,
-        "session_key": "test-key",
-        "profile_home": str(inner_home),
-    }
-
-    outer_token = set_hermes_home_override(outer_home)
-    try:
-        server._persist_live_session_system_prompt(session)
-
-        # The prompt was built under the session's profile, not the outer one.
-        assert built_homes == [str(inner_home)]
-        # The caller's pre-existing override survived, instead of being reset
-        # to None.
-        assert get_hermes_home_override() == str(outer_home)
-    finally:
-        reset_hermes_home_override(outer_token)
-    assert get_hermes_home_override() is None
-
-
-def test_persist_live_session_system_prompt_binds_session_cwd(monkeypatch, tmp_path):
-    """The prompt rebuild after a live model switch must record the SESSION's
-    working directory, not the process TERMINAL_CWD.
-
-    The function runs on the RPC dispatcher thread (model.switch, config.set
-    model). On that thread the _SESSION_CWD contextvar is not set, so
-    resolve_agent_cwd() falls back to TERMINAL_CWD, which the desktop pins
-    to the home directory. The wrong cwd line then persists into the stored
-    prompt. Later turns restore the stored bytes without change (the
-    prologue rebuilds only when _cached_system_prompt is None), so the
-    poisoned line never self-heals.
-    """
-    session_cwd = tmp_path / "project"
-    session_cwd.mkdir()
-    process_cwd = tmp_path / "home-fallback"
-    process_cwd.mkdir()
-    monkeypatch.setenv("TERMINAL_CWD", str(process_cwd))
-
-    persisted = {}
-
-    class FakeAgent:
-        model = "test-model"
-        provider = "test"
-        session_id = "cwd-test-session"
-        _cached_system_prompt = None
-        _session_db = None
-
-        def _build_system_prompt(self, system_message=None):
-            # The real builder embeds resolve_agent_cwd() via
-            # prompt_builder.build_environment_hints().
-            from agent.runtime_cwd import resolve_agent_cwd
-
-            return f"Current working directory: {resolve_agent_cwd()}"
-
-    class FakeDB:
-        def update_system_prompt(self, session_id, prompt):
-            persisted["prompt"] = prompt
-
-    agent = FakeAgent()
-    agent._session_db = FakeDB()
-    session = {
-        "agent": agent,
-        "session_key": "cwd-test-session",
-        "cwd": str(session_cwd),
-        "explicit_cwd": True,
-        "profile_home": None,
-    }
-
-    # A bare thread has no _SESSION_CWD contextvar — the RPC dispatcher shape.
-    result = {}
-
-    def dispatcher_thread():
-        server._persist_live_session_system_prompt(session)
-        result["cached"] = agent._cached_system_prompt
-
-    t = threading.Thread(target=dispatcher_thread)
-    t.start()
-    t.join()
-
-    expected = f"Current working directory: {session_cwd}"
-    assert result["cached"] == expected, result["cached"]
-    assert persisted["prompt"] == expected, persisted["prompt"]
 
 
 def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):

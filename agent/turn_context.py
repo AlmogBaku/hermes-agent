@@ -178,6 +178,12 @@ def consume_surface_switch_note(agent: Any) -> str:
     return _pop_turn_note(agent, "_surface_switch_note")
 
 
+def consume_model_switch_note(agent: Any) -> str:
+    """Pop the model-switch announcement staged at turn start (agent/model_switch_note.py); same
+    channel as the surface-switch note."""
+    return _pop_turn_note(agent, "_model_switch_note")
+
+
 def consume_skills_index_note(agent: Any) -> str:
     """Pop the skills-index delta staged by the system-prompt restore; same channel as above."""
     return _pop_turn_note(agent, "_skills_index_note")
@@ -973,12 +979,12 @@ def _merge_gateway_notes(
 ) -> str:
     """Must-deliver per-turn notes ride the user-message injection channel (one-shot) so the
     ephemeral system prompt stays byte-stable: the gateway's staged notes, plugin go-live notices no
-    tool result carried, then the surface-switch correction. Multimodal (list) content can't take the
+    tool result carried, then the surface- and model-switch corrections. Multimodal (list) content can't take the
     string sidecar — append a durable text part instead."""
     forward_lsp_verdicts(agent)  # late LSP verdicts on last turn's edits ride the plugin-notice queue
     _turn_notes = "\n\n".join(
         part for part in (consume_gateway_turn_context_notes(agent), pop_plugin_notices(agent),
-                          consume_surface_switch_note(agent),
+                          consume_surface_switch_note(agent), consume_model_switch_note(agent),
                           consume_skills_index_note(agent)) if part
     )
     if not _turn_notes:
@@ -1307,6 +1313,9 @@ def build_turn_context(
     if agent._cached_system_prompt is None:
         restore_or_build_system_prompt(agent, system_message, conversation_history)
     active_system_prompt = agent._cached_system_prompt
+    # A model switch keeps the prompt above; a warm agent and a restored one alike announce it here.
+    from agent.model_switch_note import stage_model_switch_note
+    stage_model_switch_note(agent, active_system_prompt, conversation_history)
     # `/delegation <backend> --now`: after the pin restore, so a fresh agent rebuilds too.
     from agent.delegation_backends import apply_requested_tool_rebuild
     apply_requested_tool_rebuild(agent)

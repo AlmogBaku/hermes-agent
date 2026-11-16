@@ -586,10 +586,16 @@ def _guidance_parts(agent: Any) -> list[str]:
     from agent.oneshot_footprint import agent_is_oneshot
     if not agent_is_oneshot(agent):
         parts.append(STEER_CHANNEL_NOTE)
-    # agent.tool_use_enforcement / agent.execution_guidance: "auto" (default)
-    # matches the hardcoded model lists; true/false force; a list gives custom
-    # model-name substrings.  Execution guidance is an independent gate so
-    # DeepSeek/Kimi/Qwen-class models get it even with enforcement off.
+    return parts + _model_gated_guidance(agent)
+
+
+def _model_gated_guidance(agent: Any) -> list[str]:
+    """Guidance chosen by the model id (tool-using agents only).
+
+    agent.tool_use_enforcement / agent.execution_guidance: "auto" (default) matches the hardcoded
+    model lists; true/false force; a list gives custom model-name substrings.  Execution guidance is
+    an independent gate so DeepSeek/Kimi/Qwen-class models get it even with enforcement off."""
+    parts: list[str] = []
     if _model_gate(agent._tool_use_enforcement, agent.model, TOOL_USE_ENFORCEMENT_MODELS):
         parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
         if any(g in (agent.model or "").lower() for g in ("gemini", "gemma")):
@@ -598,6 +604,13 @@ def _guidance_parts(agent: Any) -> list[str]:
         from agent.prompt_builder import execution_guidance_text
         parts.append(execution_guidance_text(agent.valid_tool_names))
     return parts
+
+
+def model_specific_parts(agent: Any) -> list[str]:
+    """Every block the prompt build chooses by model id or provider. A model switch keeps the
+    stored prompt, so its announcement carries the ones that prompt lacks (agent/model_switch_note.py)."""
+    gated = _model_gated_guidance(agent) if getattr(agent, "valid_tool_names", None) else []
+    return gated + _alibaba_identity_part(agent)
 
 
 def _alibaba_identity_part(agent: Any) -> list[str]:

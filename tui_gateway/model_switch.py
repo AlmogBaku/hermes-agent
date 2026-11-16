@@ -273,7 +273,7 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
                              f"staying on {getattr(agent, 'model', current_model)}.") from exc
         _restart_slash_worker(sid, session)
         _persist_live_session_runtime(session)
-        _persist_live_session_system_prompt(session)
+        # The stored system prompt is kept; the marker announces the new route (agent/model_switch_note.py).
         _append_model_switch_marker(session, model=result.new_model, provider=result.target_provider)
         _emit_session_info(sid, session)
         if snapshot is not None:
